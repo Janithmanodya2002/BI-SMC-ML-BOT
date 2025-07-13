@@ -6,6 +6,7 @@ import optuna
 import csv
 import asyncio
 import ccxt
+import concurrent.futures
 import pandas as pd
 import pandas_ta as ta
 import time
@@ -58,17 +59,19 @@ SIGNAL_CONFIDENCE_THRESHOLD = 0.7
 
 # --- Logging Setup ---
 
-logging.getLogger("httpx").setLevel(logging.WARNING)
+def setup_logging():
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler("smc_bot.log"),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("smc_bot.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+logger = setup_logging()
 
 if not all([BINANCE_API_KEY, BINANCE_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
     logger.error("Missing required environment variables. Please set BINANCE_API_KEY, BINANCE_API_SECRET, TELEGRAM_BOT_TOKEN, and TELEGRAM_CHAT_ID.")
@@ -102,29 +105,58 @@ def get_binance_client(authenticated=True):
         logger.error(f"Network error connecting to Binance: {e}")
         return None
 
+from tqdm import tqdm
+
 def fetch_ohlcv(client, symbol, timeframe, since=None):
-    """Fetches all available historical OHLCV data from Binance."""
+    """
+    Fetches all available historical OHLCV data from Binance, caching it to a local file.
+    """
+    data_dir = 'data'
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir)
+
+    safe_symbol = symbol.replace('/', '_')
+    cache_file = f"{data_dir}/{safe_symbol}_{timeframe}.csv"
+
+    # If cache exists, load from it
+    if os.path.exists(cache_file):
+        logger.info(f"Loading cached data for {symbol} ({timeframe}) from {cache_file}")
+        df = pd.read_csv(cache_file, index_col='timestamp', parse_dates=True)
+        return df
+
+    # If cache does not exist, download the data
+    logger.info(f"No cache found for {symbol} ({timeframe}). Downloading new data.")
+    
     if not client:
         return pd.DataFrame()
+        
     try:
         all_ohlcv = []
-        while True:
-            ohlcv = client.fetch_ohlcv(symbol, timeframe, since=since)
-            if not ohlcv:
-                break
-            all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 1
+        if since is None:
+            since = client.parse8601('2017-01-01T00:00:00Z')
 
+        with tqdm(total=None, desc=f"Downloading {symbol} {timeframe}") as pbar:
+            while True:
+                ohlcv = client.fetch_ohlcv(symbol, timeframe, since=since)
+                if not ohlcv:
+                    break
+                all_ohlcv.extend(ohlcv)
+                since = ohlcv[-1][0] + 1
+                pbar.update(len(ohlcv))
+        
         if not all_ohlcv:
-            logger.warning(f"No data found for {symbol} ({timeframe})")
+            logger.warning(f"No new data found for {symbol} ({timeframe})")
             return pd.DataFrame()
 
         df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
-        if len(df.index) >= 3:
-            df.index.freq = pd.infer_freq(df.index)
+        
+        df.to_csv(cache_file)
+        logger.info(f"Cached data for {symbol} ({timeframe}) to {cache_file}")
+
         return df
+
     except ccxt.BadSymbol:
         logger.error(f"Symbol {symbol} not found on Binance.")
         return pd.DataFrame()
@@ -206,56 +238,102 @@ def is_mitigation_zone(candle, fvg_zones, ob_zones):
             return True
     return False
 
+def label_smc_patterns_chunk(df_chunk):
+    """
+    Applies SMC pattern labeling to a chunk of the dataframe.
+    """
+    try:
+        for i in range(2, len(df_chunk) - 1):
+            previous_candle = df_chunk.iloc[i-1]
+            current_candle = df_chunk.iloc[i]
+            next_candle = df_chunk.iloc[i+1]
+            df_slice = df_chunk.iloc[:i]
+
+            labels = []
+
+            if is_order_block(current_candle, previous_candle):
+                df_chunk.at[df_chunk.index[i], 'order_block'] = True
+                labels.append('OB')
+
+            if is_fair_value_gap(current_candle, previous_candle, next_candle):
+                df_chunk.at[df_chunk.index[i], 'fair_value_gap'] = True
+                labels.append('FVG')
+
+            if is_breaker_block(current_candle, previous_candle, df_slice):
+                df_chunk.at[df_chunk.index[i], 'breaker_block'] = True
+                labels.append('BB')
+
+            if len(df_slice) > 10:
+                recent_swing_high = df_slice['high'].rolling(window=10).max().iloc[-2]
+                recent_swing_low = df_slice['low'].rolling(window=10).min().iloc[-2]
+                if is_liquidity_run(current_candle, recent_swing_high, recent_swing_low):
+                    df_chunk.at[df_chunk.index[i], 'liquidity_run'] = True
+                    labels.append('LR')
+
+            fvg_zones = df_chunk.loc[df_chunk['fair_value_gap']]
+            ob_zones = df_chunk.loc[df_chunk['order_block']]
+            if is_mitigation_zone(current_candle, fvg_zones, ob_zones):
+                df_chunk.at[df_chunk.index[i], 'mitigation_zone'] = True
+                labels.append('MZ')
+
+            df_chunk.at[df_chunk.index[i], 'smc_labels'] = labels
+        return df_chunk
+    except Exception as e:
+        logger.error(f"An error occurred in label_smc_patterns_chunk: {e}")
+        return None
+
+def process_symbol(symbol):
+    """
+    Downloads and labels data for a single symbol.
+    """
+    try:
+        unauthenticated_client = get_binance_client(authenticated=False)
+        logger.info(f"Processing symbol: {symbol}")
+        
+        logger.info(f"Fetching 5m data for {symbol}...")
+        df_5m = fetch_ohlcv(unauthenticated_client, symbol, '5m')
+        
+        logger.info(f"Fetching 1h data for {symbol}...")
+        df_1h = fetch_ohlcv(unauthenticated_client, symbol, '1h')
+
+        if df_5m.empty or df_1h.empty:
+            logger.warning(f"Could not fetch sufficient data for {symbol}. Skipping...")
+            return None
+
+        logger.info(f"Labeling 5m SMC patterns for {symbol}...")
+        df_5m = label_smc_patterns(df_5m)
+        
+        logger.info(f"Labeling 1h SMC patterns for {symbol}...")
+        df_1h = label_smc_patterns(df_1h)
+        
+        with open("last_symbol.txt", "w") as f:
+            f.write(symbol)
+            
+        logger.info(f"Finished processing symbol: {symbol}")
+        return df_5m, df_1h
+    except Exception as e:
+        logger.error(f"An error occurred while processing symbol {symbol}: {e}")
+        return None
+
 def label_smc_patterns(df):
     """
-    Applies SMC pattern labeling to the dataframe.
+    Applies SMC pattern labeling to the dataframe using multithreading.
     """
     df['order_block'] = False
     df['fair_value_gap'] = False
     df['breaker_block'] = False
     df['liquidity_run'] = False
     df['mitigation_zone'] = False
-
-    # Allow composite labels
     df['smc_labels'] = [[] for _ in range(len(df))]
 
-    for i in range(2, len(df) - 1): # Start from 2 to have enough history for breaker blocks
-        previous_candle = df.iloc[i-1]
-        current_candle = df.iloc[i]
-        next_candle = df.iloc[i+1]
-        df_slice = df.iloc[:i]
+    num_processes = 4  # Limit the number of threads
+    chunk_size = max(1000, len(df) // num_processes)  # Increase chunk size
+    chunks = [df.iloc[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
 
-        labels = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_processes) as executor:
+        results = list(tqdm(executor.map(label_smc_patterns_chunk, chunks), total=len(chunks), desc="Labeling SMC Patterns"))
 
-        if is_order_block(current_candle, previous_candle):
-            df.at[df.index[i], 'order_block'] = True
-            labels.append('OB')
-
-        if is_fair_value_gap(current_candle, previous_candle, next_candle):
-            df.at[df.index[i], 'fair_value_gap'] = True
-            labels.append('FVG')
-
-        if is_breaker_block(current_candle, previous_candle, df_slice):
-            df.at[df.index[i], 'breaker_block'] = True
-            labels.append('BB')
-
-        # Simplified swing points for liquidity run
-        recent_swing_high = df_slice['high'].rolling(window=10).max().iloc[-2]
-        recent_swing_low = df_slice['low'].rolling(window=10).min().iloc[-2]
-        if is_liquidity_run(current_candle, recent_swing_high, recent_swing_low):
-            df.at[df.index[i], 'liquidity_run'] = True
-            labels.append('LR')
-
-        # Simplified mitigation zone detection
-        fvg_zones = df.loc[df['fair_value_gap']]
-        ob_zones = df.loc[df['order_block']]
-        if is_mitigation_zone(current_candle, fvg_zones, ob_zones):
-            df.at[df.index[i], 'mitigation_zone'] = True
-            labels.append('MZ')
-
-        df.at[df.index[i], 'smc_labels'] = labels
-
-    return df
+    return pd.concat([res for res in results if res is not None])
 
 # --- Feature Engineering ---
 
@@ -428,52 +506,75 @@ def load_artifacts(model_path='smc_model.pkl', scaler_path='scaler.pkl'):
 
 # --- Live Inference & Signal Construction ---
 
-def get_signal(df_latest, models, scaler, features, symbol):
+def get_signal(df_latest, models, scaler, features, symbol, df_higher_tf):
     """
-    Runs inference on the latest data and constructs a signal if conditions are met.
+    Runs inference on the latest data and constructs a signal if multiple conditions are met,
+    including a trend filter from a higher timeframe.
     """
     if df_latest.empty:
         return None
 
+    # --- Higher Timeframe Trend Analysis ---
+    htf_trend = df_higher_tf['htf_trend_slope'].iloc[-1]
+    
     # Prepare features for the latest candle
     latest_features_df = pd.DataFrame(df_latest[features])
-    latest_features_df = latest_features_df[features] # Ensure column order
+    latest_features_df = latest_features_df[features]  # Ensure column order
     latest_features_df.fillna(0, inplace=True)
 
     latest_features_scaled = scaler.transform(latest_features_df)
 
     patterns = ['order_block', 'fair_value_gap', 'breaker_block', 'liquidity_run', 'mitigation_zone']
+    
+    # --- Multi-Condition Logic ---
+    met_conditions = []
+    confidences = {}
 
     for i, model in enumerate(models):
         if model is None:
             continue
 
-        # Probability of the positive class for each pattern
         pred_proba = model.predict_proba(latest_features_scaled)[:, 1]
-
         if pred_proba[0] >= SIGNAL_CONFIDENCE_THRESHOLD:
-            # Construct signal
-            side = 'buy' # This should be determined by the model/logic
-            entry_price = df_latest['close'].iloc[0]
-            atr = df_latest['ATRr_14'].iloc[0] if 'ATRr_14' in df_latest.columns else 0.001
-            stop_loss = entry_price - (atr * STOP_LOSS_ATR_MULTIPLIER)
-            take_profit = entry_price + (atr * TAKE_PROFIT_ATR_MULTIPLIER)
+            met_conditions.append(patterns[i])
+            confidences[patterns[i]] = pred_proba[0]
 
-            signal = {
-                'symbol': symbol,
-                'side': side,
-                'entry_price': entry_price,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'quantity': 1, # This should be calculated based on risk
-                'pattern': patterns[i],
-                'confidence': pred_proba[0],
-                'timeframe': df_latest.index.freqstr if hasattr(df_latest.index, 'freqstr') else '5m',
-            }
-            logger.info(f"Signal generated: {signal}")
-            return signal # Return the first signal that meets the threshold
+    # Require at least 2 conditions to be met
+    if len(met_conditions) < 2:
+        return None
 
-    return None
+    # --- Signal Construction with HTF Filter ---
+    side = None
+    if htf_trend > 0 and 'order_block' in met_conditions and 'fair_value_gap' in met_conditions:
+        side = 'buy'
+    elif htf_trend < 0 and 'breaker_block' in met_conditions:
+        side = 'sell'
+    else:
+        return None # Conditions not met for a trade
+    
+    entry_price = df_latest['close'].iloc[0]
+    atr = df_latest['ATRr_14'].iloc[0] if 'ATRr_14' in df_latest.columns else 0.001
+    
+    if side == 'buy':
+        stop_loss = entry_price - (atr * STOP_LOSS_ATR_MULTIPLIER)
+        take_profit = entry_price + (atr * TAKE_PROFIT_ATR_MULTIPLIER)
+    else: # Sell
+        stop_loss = entry_price + (atr * STOP_LOSS_ATR_MULTIPLIER)
+        take_profit = entry_price - (atr * TAKE_PROFIT_ATR_MULTIPLIER)
+
+    signal = {
+        'symbol': symbol,
+        'side': side,
+        'entry_price': entry_price,
+        'stop_loss': stop_loss,
+        'take_profit': take_profit,
+        'quantity': 1,  # This should be calculated based on risk
+        'pattern': ", ".join(met_conditions),
+        'confidence': np.mean(list(confidences.values())),
+        'timeframe': df_latest.index.freqstr if hasattr(df_latest.index, 'freqstr') else '5m',
+    }
+    logger.info(f"Signal generated: {signal}")
+    return signal
 
 # --- Order Execution & Telegram Alerts ---
 
@@ -593,7 +694,7 @@ def trail_stop_loss(client, order, atr):
 
 # --- Main Loop & Scheduling ---
 
-def main():
+async def main(application):
     """
     Main execution loop for the bot.
     """
@@ -625,27 +726,33 @@ def main():
             return
 
     if not models or not scaler:
-        logger.info("Performing initial data load and model training...")
-        # For simplicity, we train on the first symbol in the list.
-        training_symbol = TRADING_SYMBOLS[0]
-        logger.info(f"Fetching data for {training_symbol}...")
-        df_5m = fetch_ohlcv(unauthenticated_client, training_symbol, '5m')
-        df_15m = fetch_ohlcv(unauthenticated_client, training_symbol, '15m')
-        df_1h = fetch_ohlcv(unauthenticated_client, training_symbol, '1h')
-        df_4h = fetch_ohlcv(unauthenticated_client, training_symbol, '4h')
+        logger.info("Performing initial data load and model training for all symbols...")
+        
+        last_symbol = None
+        if os.path.exists("last_symbol.txt"):
+            with open("last_symbol.txt", "r") as f:
+                last_symbol = f.read().strip()
+        
+        start_index = 0
+        if last_symbol in TRADING_SYMBOLS:
+            start_index = TRADING_SYMBOLS.index(last_symbol) + 1
+            
+        with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            results = list(tqdm(executor.map(process_symbol, TRADING_SYMBOLS[start_index:]), total=len(TRADING_SYMBOLS[start_index:]), desc="Processing Symbols"))
 
-        if df_5m.empty or df_15m.empty or df_1h.empty or df_4h.empty:
-            logger.error(f"Could not fetch sufficient data for {training_symbol}. Exiting.")
+        all_dfs_5m = [result[0] for result in results if result is not None]
+        all_dfs_1h = [result[1] for result in results if result is not None]
+
+        if not all_dfs_5m:
+            logger.error("No data fetched for any symbol. Exiting.")
             return
 
-        logger.info("Labeling SMC patterns...")
-        df_5m = label_smc_patterns(df_5m)
-        df_15m = label_smc_patterns(df_15m)
-        df_1h = label_smc_patterns(df_1h)
-        df_4h = label_smc_patterns(df_4h)
-
-        logger.info("Creating features...")
-        features_df = create_features(df_5m, df_1h) # Still using 1h as the higher TF for now
+        # Combine data from all symbols
+        combined_df_5m = pd.concat(all_dfs_5m)
+        combined_df_1h = pd.concat(all_dfs_1h)
+        
+        logger.info("Creating features for combined data...")
+        features_df = create_features(combined_df_5m, combined_df_1h)
 
         scaled_df, scaler, features = scale_features(features_df)
 
@@ -669,7 +776,7 @@ def main():
     while True:
         try:
             if application.bot_data.get('paused', False):
-                time.sleep(60)
+                await asyncio.sleep(60)
                 continue
 
             # Trail stop losses for open orders
@@ -697,27 +804,27 @@ def main():
                     last_candle_features = latest_features_df.iloc[[-1]]
 
                     # Get signal
-                    signal = get_signal(last_candle_features, models, scaler, features, symbol)
+                    signal = get_signal(last_candle_features, models, scaler, features, symbol, latest_df_1h)
 
                     if signal:
-                        asyncio.run(send_telegram_alert(signal))
+                        await send_telegram_alert(signal)
                         if authenticated_client:
                             atr = latest_features_df['ATRr_14'].iloc[-1]
                             order = execute_order(authenticated_client, signal, atr)
                             if order:
                                 open_orders.append(order)
 
-            # Wait for the next candle
-            logger.info("Completed a cycle through all symbols. Waiting for the next 5m candle...")
-            time.sleep(300) # 5 minutes
+            # Wait for a shorter interval for higher frequency
+            logger.info("Completed a cycle through all symbols. Waiting for 1 minute...")
+            await asyncio.sleep(60) # 1 minute
 
         except ccxt.NetworkError as e:
             logger.error(f"Network error: {e}. Reconnecting...")
-            time.sleep(60)
+            await asyncio.sleep(60)
             binance_client = get_binance_client()
         except Exception as e:
             logger.error(f"An unexpected error occurred in the main loop: {e}")
-            time.sleep(60)
+            await asyncio.sleep(60)
 
 def start(update, context):
     update.message.reply_text('SMC Bot started!')
@@ -770,7 +877,7 @@ def run_backtest(symbol, days=30):
 
     for i in range(1, len(scaled_df)):
         last_candle_features = scaled_df.iloc[[i]]
-        signal = get_signal(last_candle_features, model, scaler, features, symbol)
+        signal = get_signal(last_candle_features, model, scaler, features, symbol, df_1h)
 
         if signal:
             trades += 1
@@ -781,10 +888,10 @@ def run_backtest(symbol, days=30):
 
             # Simplified PnL calculation
             if np.random.rand() > 0.5: # 50% win rate
-                pnl += (take_profit - entry_price)
+                pnl += abs(take_profit - entry_price)
                 wins += 1
             else:
-                pnl -= (entry_price - stop_loss)
+                pnl -= abs(entry_price - stop_loss)
                 losses += 1
 
     # Performance Report
@@ -798,6 +905,28 @@ def run_backtest(symbol, days=30):
     logger.info(f"Final Balance: ${balance + pnl:.2f}")
     logger.info("------------------------------------")
 
+from telegram.request import HTTPXRequest
+
+async def run_bot():
+    request = HTTPXRequest(connect_timeout=30, read_timeout=30)
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).request(request).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("pause", pause))
+    application.add_handler(CommandHandler("resume", resume))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CallbackQueryHandler(handle_telegram_callback))
+
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+
+    await main(application)
+
+    await application.updater.stop()
+    await application.stop()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='SMC Trading Bot')
     parser.add_argument('--backtest', type=str, help='Run a backtest for the specified symbol (e.g., BTC/USDT)')
@@ -808,17 +937,4 @@ if __name__ == "__main__":
     if args.backtest:
         run_backtest(args.backtest, args.days)
     else:
-        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("pause", pause))
-        application.add_handler(CommandHandler("resume", resume))
-        application.add_handler(CommandHandler("status", status))
-        application.add_handler(CallbackQueryHandler(handle_telegram_callback))
-
-        # Run the main function in a separate thread
-        main_thread = threading.Thread(target=main)
-        main_thread.start()
-
-        application.run_polling()
-        main_thread.join()
+        asyncio.run(run_bot())
