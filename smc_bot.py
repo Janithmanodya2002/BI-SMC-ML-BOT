@@ -645,7 +645,7 @@ def main():
                     last_candle_features = latest_features_df.iloc[[-1]]
 
                     # Get signal
-                    signal = get_signal(last_candle_features, model, scaler, features, symbol)
+                    signal = get_signal(last_candle_features, models, scaler, features, symbol)
 
                     if signal:
                         send_telegram_alert(signal)
