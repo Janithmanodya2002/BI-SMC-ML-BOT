@@ -2,7 +2,9 @@ import os
 import logging
 import argparse
 import threading
+import optuna
 import csv
+import asyncio
 import ccxt
 import pandas as pd
 import pandas_ta as ta
@@ -100,20 +102,32 @@ def get_binance_client(authenticated=True):
         logger.error(f"Network error connecting to Binance: {e}")
         return None
 
-def fetch_ohlcv(client, symbol, timeframe, since=None, limit=1000):
-    """Fetches historical OHLCV data from Binance."""
+def fetch_ohlcv(client, symbol, timeframe, since=None):
+    """Fetches all available historical OHLCV data from Binance."""
     if not client:
         return pd.DataFrame()
     try:
-        if since is None:
-            since = client.parse8601((datetime.utcnow() - timedelta(days=30)).isoformat())
+        all_ohlcv = []
+        while True:
+            ohlcv = client.fetch_ohlcv(symbol, timeframe, since=since)
+            if not ohlcv:
+                break
+            all_ohlcv.extend(ohlcv)
+            since = ohlcv[-1][0] + 1
 
-        ohlcv = client.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        if not all_ohlcv:
+            logger.warning(f"No data found for {symbol} ({timeframe})")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
-        df.index.freq = pd.infer_freq(df.index)
+        if len(df.index) >= 3:
+            df.index.freq = pd.infer_freq(df.index)
         return df
+    except ccxt.BadSymbol:
+        logger.error(f"Symbol {symbol} not found on Binance.")
+        return pd.DataFrame()
     except Exception as e:
         logger.error(f"Error fetching OHLCV data for {symbol} ({timeframe}): {e}")
         return pd.DataFrame()
@@ -318,10 +332,53 @@ def get_trend_slope(series, window=20):
 
 # --- Model Training & Artifact Management ---
 
-def train_model(df, features):
+def objective(trial, df, features):
+    """
+    Objective function for Optuna hyperparameter tuning.
+    """
+    # Define hyperparameters to tune
+    solver = trial.suggest_categorical('solver', ['liblinear', 'saga'])
+    c = trial.suggest_float('C', 1e-4, 1e4, log=True)
+
+    params = {'solver': solver, 'C': c}
+
+    targets = ['order_block', 'fair_value_gap', 'breaker_block', 'liquidity_run', 'mitigation_zone']
+
+    X = df[features]
+    y = df[targets]
+
+    total_accuracy = 0
+    num_models = 0
+
+    for target in targets:
+        if len(y[target].unique()) < 2:
+            continue
+
+        num_models += 1
+        tscv = TimeSeriesSplit(n_splits=5)
+        accuracies = []
+        for train_index, test_index in tscv.split(X):
+            X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+            y_train, y_test = y.iloc[train_index][target], y.iloc[test_index][target]
+
+            model = LogisticRegression(**params)
+            model.fit(X_train, y_train)
+
+            y_pred = model.predict(X_test)
+            accuracy = accuracy_score(y_test, y_pred)
+            accuracies.append(accuracy)
+
+        total_accuracy += np.mean(accuracies)
+
+    return total_accuracy / num_models if num_models > 0 else 0
+
+def train_model(df, features, params=None):
     """
     Trains a multi-output model using time-series cross-validation, handling single-class data.
     """
+    if params is None:
+        params = {}
+
     targets = ['order_block', 'fair_value_gap', 'breaker_block', 'liquidity_run', 'mitigation_zone']
 
     X = df[features]
@@ -333,38 +390,19 @@ def train_model(df, features):
         logger.info(f"- {target}: {y[target].value_counts(normalize=True).to_dict()}")
 
     # --- Train Model ---
-    tscv = TimeSeriesSplit(n_splits=5)
-
-    # Use a list to store estimators for each target
     estimators = []
 
     for target in targets:
         if len(y[target].unique()) < 2:
             logger.warning(f"Skipping training for '{target}' due to single-class data.")
-            # We'll need to handle this in prediction as well
             estimators.append(None)
             continue
 
-        accuracies = []
-        for train_index, test_index in tscv.split(X):
-            X_train, X_test = X.iloc[train_index], X.iloc[test_index]
-            y_train, y_test = y.iloc[train_index][target], y.iloc[test_index][target]
-
-            model = LogisticRegression()
-            model.fit(X_train, y_train)
-
-            y_pred = model.predict(X_test)
-            accuracy = accuracy_score(y_test, y_pred)
-            accuracies.append(accuracy)
-
-        logger.info(f"'{target}' model accuracy (Time-Series CV): {np.mean(accuracies):.2f}")
-
         # Train final model on all data for this target
-        final_model_target = LogisticRegression()
+        final_model_target = LogisticRegression(**params)
         final_model_target.fit(X, y[target])
         estimators.append(final_model_target)
 
-    # We are now returning a list of models, one for each target
     return estimators, features
 
 def save_artifacts(models, scaler, model_path='smc_model.pkl', scaler_path='scaler.pkl'):
@@ -398,8 +436,8 @@ def get_signal(df_latest, models, scaler, features, symbol):
         return None
 
     # Prepare features for the latest candle
-    latest_features_df = pd.DataFrame(columns=features)
-    latest_features_df = latest_features_df.append(df_latest[features], ignore_index=True)
+    latest_features_df = pd.DataFrame(df_latest[features])
+    latest_features_df = latest_features_df[features] # Ensure column order
     latest_features_df.fillna(0, inplace=True)
 
     latest_features_scaled = scaler.transform(latest_features_df)
@@ -439,7 +477,7 @@ def get_signal(df_latest, models, scaler, features, symbol):
 
 # --- Order Execution & Telegram Alerts ---
 
-def send_telegram_alert(signal):
+async def send_telegram_alert(signal):
     """
     Sends a formatted alert to a Telegram channel with an inline keyboard.
     """
@@ -463,7 +501,7 @@ def send_telegram_alert(signal):
             f"Take Profit: {signal['take_profit']:.2f}\n"
             f"Risked Quantity: {signal['quantity']}"
         )
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, reply_markup=reply_markup)
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, reply_markup=reply_markup)
         logger.info("Telegram alert sent successfully.")
     except Exception as e:
         logger.error(f"Failed to send Telegram alert: {e}")
@@ -590,20 +628,34 @@ def main():
         logger.info("Performing initial data load and model training...")
         # For simplicity, we train on the first symbol in the list.
         training_symbol = TRADING_SYMBOLS[0]
-        df_5m = fetch_ohlcv(unauthenticated_client, training_symbol, '5m', limit=1500)
-        df_1h = fetch_ohlcv(unauthenticated_client, training_symbol, '1h', limit=1500)
+        logger.info(f"Fetching data for {training_symbol}...")
+        df_5m = fetch_ohlcv(unauthenticated_client, training_symbol, '5m')
+        df_15m = fetch_ohlcv(unauthenticated_client, training_symbol, '15m')
+        df_1h = fetch_ohlcv(unauthenticated_client, training_symbol, '1h')
+        df_4h = fetch_ohlcv(unauthenticated_client, training_symbol, '4h')
 
-        if df_5m.empty or df_1h.empty:
-            logger.error(f"Could not fetch data for {training_symbol}. Exiting.")
+        if df_5m.empty or df_15m.empty or df_1h.empty or df_4h.empty:
+            logger.error(f"Could not fetch sufficient data for {training_symbol}. Exiting.")
             return
 
+        logger.info("Labeling SMC patterns...")
         df_5m = label_smc_patterns(df_5m)
+        df_15m = label_smc_patterns(df_15m)
         df_1h = label_smc_patterns(df_1h)
+        df_4h = label_smc_patterns(df_4h)
 
-        features_df = create_features(df_5m, df_1h)
+        logger.info("Creating features...")
+        features_df = create_features(df_5m, df_1h) # Still using 1h as the higher TF for now
 
         scaled_df, scaler, features = scale_features(features_df)
-        models, _ = train_model(scaled_df, features)
+
+        logger.info("Running Optuna hyperparameter tuning...")
+        study = optuna.create_study(direction='maximize')
+        study.optimize(lambda trial: objective(trial, scaled_df, features), n_trials=args.optuna_trials)
+        best_params = study.best_params
+        logger.info(f"Best Optuna params: {best_params}")
+
+        models, _ = train_model(scaled_df, features, best_params)
 
         if models and scaler:
             save_artifacts(models, scaler)
@@ -648,7 +700,7 @@ def main():
                     signal = get_signal(last_candle_features, models, scaler, features, symbol)
 
                     if signal:
-                        send_telegram_alert(signal)
+                        asyncio.run(send_telegram_alert(signal))
                         if authenticated_client:
                             atr = latest_features_df['ATRr_14'].iloc[-1]
                             order = execute_order(authenticated_client, signal, atr)
@@ -750,6 +802,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='SMC Trading Bot')
     parser.add_argument('--backtest', type=str, help='Run a backtest for the specified symbol (e.g., BTC/USDT)')
     parser.add_argument('--days', type=int, default=30, help='Number of days to backtest')
+    parser.add_argument('--optuna-trials', type=int, default=10, help='Number of Optuna trials to run')
     args = parser.parse_args()
 
     if args.backtest:
