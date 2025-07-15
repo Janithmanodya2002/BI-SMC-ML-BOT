@@ -586,8 +586,8 @@ def get_signal(df_latest, models, scaler, features, symbol, df_higher_tf):
     else:
         return None # Conditions not met for a trade
     
-    entry_price = df_latest['close'].iloc[0]
-    atr = df_latest['ATRr_14'].iloc[0] if 'ATRr_14' in df_latest.columns else 0.001
+    entry_price = df_latest['close'].iloc[-1]
+    atr = df_latest['ATRr_14'].iloc[-1] if 'ATRr_14' in df_latest.columns else 0.001
     
     if side == 'buy':
         stop_loss = entry_price - (atr * STOP_LOSS_ATR_MULTIPLIER)
@@ -628,12 +628,12 @@ async def send_telegram_alert(signal):
 
         message = (
             f"🚀 New Signal: {signal['symbol']} 🚀\n"
-            f"Pattern: {signal['pattern']} ({signal['confidence']:.2f}%)\n"
+            f"Pattern: {signal['pattern']} ({signal['confidence']*100:.2f}%)\n"
             f"Timeframe: {signal['timeframe']}\n"
             f"Side: {signal['side'].upper()}\n"
-            f"Entry: {signal['entry_price']:.2f}\n"
-            f"Stop Loss: {signal['stop_loss']:.2f}\n"
-            f"Take Profit: {signal['take_profit']:.2f}\n"
+            f"Entry: {signal['entry_price']:.4f}\n"
+            f"Stop Loss: {signal['stop_loss']:.4f}\n"
+            f"Take Profit: {signal['take_profit']:.4f}\n"
             f"Risked Quantity: {signal['quantity']}"
         )
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, reply_markup=reply_markup)
