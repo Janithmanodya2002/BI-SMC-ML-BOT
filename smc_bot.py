@@ -20,6 +20,8 @@ import joblib
 import telegram
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler
 import numpy as np
+import psutil
+from numba import njit
 
 # --- Configuration & Initialization ---
 
@@ -106,57 +108,41 @@ def get_binance_client(authenticated=True):
         return None
 
 from tqdm import tqdm
+from tqdm.contrib.concurrent import thread_map
 
-def fetch_ohlcv(client, symbol, timeframe, since=None):
+def get_progress_bar(*args, **kwargs):
     """
-    Fetches all available historical OHLCV data from Binance, caching it to a local file.
+    Returns a configured tqdm progress bar instance.
+    This is a centralized place to manage progress bar settings.
     """
-    data_dir = 'data'
-    if not os.path.exists(data_dir):
-        os.makedirs(data_dir)
+    # You can add default settings here, e.g.:
+    # kwargs.setdefault('bar_format', '{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
+    return tqdm(*args, **kwargs)
 
-    safe_symbol = symbol.replace('/', '_')
-    cache_file = f"{data_dir}/{safe_symbol}_{timeframe}.csv"
-
-    # If cache exists, load from it
-    if os.path.exists(cache_file):
-        logger.info(f"Loading cached data for {symbol} ({timeframe}) from {cache_file}")
-        df = pd.read_csv(cache_file, index_col='timestamp', parse_dates=True)
-        return df
-
-    # If cache does not exist, download the data
-    logger.info(f"No cache found for {symbol} ({timeframe}). Downloading new data.")
-    
-    if not client:
-        return pd.DataFrame()
+def thread_friendly_progress_bar(fn, items, max_workers, desc):
+    """
+    A wrapper around tqdm.contrib.concurrent.thread_map for thread-friendly progress bars.
+    """
+    with get_progress_bar(total=len(items), desc=desc) as pbar:
+        def wrapper(item):
+            result = fn(item, pbar)
+            pbar.update()
+            return result
         
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(wrapper, items))
+    return results
+
+def fetch_ohlcv(client, symbol, timeframe, since=None, limit=None):
+    """
+    Fetches historical OHLCV data from Binance.
+    """
     try:
-        all_ohlcv = []
-        if since is None:
-            since = client.parse8601('2017-01-01T00:00:00Z')
-
-        with tqdm(total=None, desc=f"Downloading {symbol} {timeframe}") as pbar:
-            while True:
-                ohlcv = client.fetch_ohlcv(symbol, timeframe, since=since)
-                if not ohlcv:
-                    break
-                all_ohlcv.extend(ohlcv)
-                since = ohlcv[-1][0] + 1
-                pbar.update(len(ohlcv))
-        
-        if not all_ohlcv:
-            logger.warning(f"No new data found for {symbol} ({timeframe})")
-            return pd.DataFrame()
-
-        df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        ohlcv = client.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
-        
-        df.to_csv(cache_file)
-        logger.info(f"Cached data for {symbol} ({timeframe}) to {cache_file}")
-
         return df
-
     except ccxt.BadSymbol:
         logger.error(f"Symbol {symbol} not found on Binance.")
         return pd.DataFrame()
@@ -174,118 +160,148 @@ def fetch_ohlcv(client, symbol, timeframe, since=None):
 
 # --- SMC Pattern Labeling ---
 
-def is_order_block(candle, previous_candle):
+@njit
+def is_order_block(high, low, close, open, i):
     """
     Identifies an Order Block.
     A simple definition: a bearish candle followed by a strong bullish move
     that breaks the high of the bearish candle. Vice-versa for bearish OB.
     """
     # Bullish Order Block
-    if previous_candle['close'] < previous_candle['open'] and candle['close'] > candle['open']:
-        if candle['high'] > previous_candle['high']:
+    if close[i-1] < open[i-1] and close[i] > open[i]:
+        if high[i] > high[i-1]:
             return True
     # Bearish Order Block
-    if previous_candle['close'] > previous_candle['open'] and candle['close'] < candle['open']:
-        if candle['low'] < previous_candle['low']:
+    if close[i-1] > open[i-1] and close[i] < open[i]:
+        if low[i] < low[i-1]:
             return True
     return False
 
-def is_fair_value_gap(candle, prev_candle, next_candle):
+@njit
+def is_fair_value_gap(high, low, i):
     """
     Identifies a Fair Value Gap (FVG) or Imbalance.
     A 3-candle pattern where there is a gap between the wicks of the 1st and 3rd candles.
     """
     # Bullish FVG
-    if candle['high'] < prev_candle['low'] and candle['high'] < next_candle['low']:
+    if high[i] < low[i-2] and high[i] < low[i+1]:
         return True
     # Bearish FVG
-    if candle['low'] > prev_candle['high'] and candle['low'] > next_candle['high']:
+    if low[i] > high[i-2] and low[i] > high[i+1]:
         return True
     return False
 
-def is_breaker_block(candle, previous_candle, df_slice):
+@njit
+def is_breaker_block(high, low, close, open, i):
     """
     Identifies a Breaker Block.
     A simplified definition: An order block that is violated.
     """
-    if is_order_block(previous_candle, df_slice.iloc[-2]):
+    if is_order_block(high, low, close, open, i-1):
         # Bullish breaker
-        if candle['close'] < previous_candle['low']:
+        if close[i] < low[i-1]:
             return True
         # Bearish breaker
-        if candle['close'] > previous_candle['high']:
+        if close[i] > high[i-1]:
             return True
     return False
 
-def is_liquidity_run(candle, recent_swing_high, recent_swing_low):
+@njit
+def is_liquidity_run(high, low, i, recent_swing_high, recent_swing_low):
     """
     Identifies a Liquidity Run (or stop hunt).
     Flags wicks that go beyond recent swing points.
     """
-    if candle['high'] > recent_swing_high or candle['low'] < recent_swing_low:
+    if high[i] > recent_swing_high or low[i] < recent_swing_low:
         return True
     return False
 
-def is_mitigation_zone(candle, fvg_zones, ob_zones):
+def check_system_load(cpu_threshold=80, memory_threshold=80):
     """
-    Identifies when price enters a Mitigation Zone (an unfilled FVG or OB).
+    Checks CPU and memory usage and logs a warning if they exceed the thresholds.
     """
-    for _, fvg in fvg_zones.iterrows():
-        if fvg['low'] < candle['close'] < fvg['high']:
-            return True
-    for _, ob in ob_zones.iterrows():
-        if ob['low'] < candle['close'] < ob['high']:
-            return True
-    return False
+    cpu_usage = psutil.cpu_percent()
+    memory_usage = psutil.virtual_memory().percent
+    
+    if cpu_usage > cpu_threshold:
+        logger.warning(f"High CPU usage detected: {cpu_usage}%")
+    if memory_usage > memory_threshold:
+        logger.warning(f"High memory usage detected: {memory_usage}%")
 
-def label_smc_patterns_chunk(df_chunk):
+@njit
+def label_smc_patterns_chunk_numba(high, low, close, open, order_block, fair_value_gap, breaker_block, liquidity_run):
+    for i in range(2, len(high) - 1):
+        if is_order_block(high, low, close, open, i):
+            order_block[i] = True
+
+        if is_fair_value_gap(high, low, i):
+            fair_value_gap[i] = True
+
+        if is_breaker_block(high, low, close, open, i):
+            breaker_block[i] = True
+
+        if i > 10:
+            recent_swing_high = np.max(high[i-11:i-1])
+            recent_swing_low = np.min(low[i-11:i-1])
+            if is_liquidity_run(high, low, i, recent_swing_high, recent_swing_low):
+                liquidity_run[i] = True
+    return order_block, fair_value_gap, breaker_block, liquidity_run
+
+def label_smc_patterns_chunk(chunk_data, pbar=None):
     """
     Applies SMC pattern labeling to a chunk of the dataframe.
     """
+    chunk_idx, df_chunk_in = chunk_data
+    df_chunk = df_chunk_in.copy()
+    if pbar:
+        pbar.set_description(f"Labeling chunk {chunk_idx} ({len(df_chunk)} rows)")
+    check_system_load()
     try:
-        for i in range(2, len(df_chunk) - 1):
-            previous_candle = df_chunk.iloc[i-1]
-            current_candle = df_chunk.iloc[i]
-            next_candle = df_chunk.iloc[i+1]
-            df_slice = df_chunk.iloc[:i]
+        high = df_chunk['high'].values
+        low = df_chunk['low'].values
+        close = df_chunk['close'].values
+        open_ = df_chunk['open'].values
+        
+        order_block = np.full(len(df_chunk), False)
+        fair_value_gap = np.full(len(df_chunk), False)
+        breaker_block = np.full(len(df_chunk), False)
+        liquidity_run = np.full(len(df_chunk), False)
 
-            labels = []
+        order_block, fair_value_gap, breaker_block, liquidity_run = label_smc_patterns_chunk_numba(
+            high, low, close, open_, order_block, fair_value_gap, breaker_block, liquidity_run
+        )
 
-            if is_order_block(current_candle, previous_candle):
-                df_chunk.at[df_chunk.index[i], 'order_block'] = True
-                labels.append('OB')
-
-            if is_fair_value_gap(current_candle, previous_candle, next_candle):
-                df_chunk.at[df_chunk.index[i], 'fair_value_gap'] = True
-                labels.append('FVG')
-
-            if is_breaker_block(current_candle, previous_candle, df_slice):
-                df_chunk.at[df_chunk.index[i], 'breaker_block'] = True
-                labels.append('BB')
-
-            if len(df_slice) > 10:
-                recent_swing_high = df_slice['high'].rolling(window=10).max().iloc[-2]
-                recent_swing_low = df_slice['low'].rolling(window=10).min().iloc[-2]
-                if is_liquidity_run(current_candle, recent_swing_high, recent_swing_low):
-                    df_chunk.at[df_chunk.index[i], 'liquidity_run'] = True
-                    labels.append('LR')
-
-            fvg_zones = df_chunk.loc[df_chunk['fair_value_gap']]
-            ob_zones = df_chunk.loc[df_chunk['order_block']]
-            if is_mitigation_zone(current_candle, fvg_zones, ob_zones):
-                df_chunk.at[df_chunk.index[i], 'mitigation_zone'] = True
-                labels.append('MZ')
-
-            df_chunk.at[df_chunk.index[i], 'smc_labels'] = labels
+        df_chunk['order_block'] = order_block
+        df_chunk['fair_value_gap'] = fair_value_gap
+        df_chunk['breaker_block'] = breaker_block
+        df_chunk['liquidity_run'] = liquidity_run
+        
+        with open("label_heartbeat.txt", "a") as hb:
+            hb.write(f"{datetime.now()}: finished chunk {chunk_idx}\n")
+        
         return df_chunk
     except Exception as e:
-        logger.error(f"An error occurred in label_smc_patterns_chunk: {e}")
-        return None
+        logger.error(f"An error occurred in label_smc_patterns_chunk {chunk_idx}: {e}")
+        return pd.DataFrame()
 
 def process_symbol(symbol):
     """
     Downloads and labels data for a single symbol.
     """
+    labeled_data_dir = 'labeled_data'
+    if not os.path.exists(labeled_data_dir):
+        os.makedirs(labeled_data_dir)
+
+    safe_symbol = symbol.replace('/', '_')
+    labeled_cache_file_5m = f"{labeled_data_dir}/{safe_symbol}_5m_labeled.csv"
+    labeled_cache_file_1h = f"{labeled_data_dir}/{safe_symbol}_1h_labeled.csv"
+
+    if os.path.exists(labeled_cache_file_5m) and os.path.exists(labeled_cache_file_1h):
+        logger.info(f"Loading cached labeled data for {symbol}")
+        df_5m = pd.read_csv(labeled_cache_file_5m, index_col='timestamp', parse_dates=True)
+        df_1h = pd.read_csv(labeled_cache_file_1h, index_col='timestamp', parse_dates=True)
+        return df_5m, df_1h
+
     try:
         unauthenticated_client = get_binance_client(authenticated=False)
         logger.info(f"Processing symbol: {symbol}")
@@ -301,10 +317,14 @@ def process_symbol(symbol):
             return None
 
         logger.info(f"Labeling 5m SMC patterns for {symbol}...")
-        df_5m = label_smc_patterns(df_5m)
+        df_5m = label_smc_patterns(df_5m, args.debug)
         
         logger.info(f"Labeling 1h SMC patterns for {symbol}...")
-        df_1h = label_smc_patterns(df_1h)
+        df_1h = label_smc_patterns(df_1h, args.debug)
+        
+        df_5m.to_csv(labeled_cache_file_5m)
+        df_1h.to_csv(labeled_cache_file_1h)
+        logger.info(f"Cached labeled data for {symbol}")
         
         with open("last_symbol.txt", "w") as f:
             f.write(symbol)
@@ -315,7 +335,7 @@ def process_symbol(symbol):
         logger.error(f"An error occurred while processing symbol {symbol}: {e}")
         return None
 
-def label_smc_patterns(df):
+def label_smc_patterns(df, debug=False):
     """
     Applies SMC pattern labeling to the dataframe using multithreading.
     """
@@ -328,12 +348,18 @@ def label_smc_patterns(df):
 
     num_processes = 4  # Limit the number of threads
     chunk_size = max(1000, len(df) // num_processes)  # Increase chunk size
-    chunks = [df.iloc[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
+    chunks = [(i, df.iloc[i:i + chunk_size]) for i in range(0, len(df), chunk_size)]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_processes) as executor:
-        results = list(tqdm(executor.map(label_smc_patterns_chunk, chunks), total=len(chunks), desc="Labeling SMC Patterns"))
-
-    return pd.concat([res for res in results if res is not None])
+    if debug:
+        results = []
+        with get_progress_bar(total=len(chunks), desc="Labeling SMC Patterns (Debug)") as pbar:
+            for chunk in chunks:
+                results.append(label_smc_patterns_chunk(chunk, pbar))
+                pbar.update()
+    else:
+        results = thread_friendly_progress_bar(label_smc_patterns_chunk, chunks, max_workers=num_processes, desc="Labeling SMC Patterns")
+        
+    return pd.concat([res for res in results if res is not None and not res.empty])
 
 # --- Feature Engineering ---
 
@@ -342,7 +368,10 @@ def create_features(df_main, df_higher_tf):
     Merges multi-timeframe data and creates features.
     """
     # Resample higher timeframe data to match the main dataframe
-    df_higher_tf = df_higher_tf.resample(df_main.index.freq).ffill()
+    df_main = df_main[~df_main.index.duplicated(keep='first')]
+    df_higher_tf = df_higher_tf[~df_higher_tf.index.duplicated(keep='first')]
+    df_main = df_main.resample('5T').ffill()
+    df_higher_tf = df_higher_tf.resample('5T').ffill()
     df = pd.merge(df_main, df_higher_tf, left_index=True, right_index=True, suffixes=('', '_htf'))
 
     # ATR for stop loss and take profit
@@ -354,18 +383,16 @@ def create_features(df_main, df_higher_tf):
 
     # --- New Feature Engineering ---
 
-    # Multi-TF Context Ratios
-    df['htf_trend_slope'] = get_trend_slope(df['close_htf'])
-
     # Zone Distance Metrics
     for zone_type in ['order_block', 'fair_value_gap', 'breaker_block']:
-        zones = df[df[zone_type]]
-        if not zones.empty:
-            # Find the index of the last zone for each row
-            last_zone_indices = zones.index.searchsorted(df.index, side='right') - 1
+        zone_indices = np.where(df[zone_type])[0]
+        if len(zone_indices) > 0:
+            # Get the index of the last zone for each row
+            last_zone_indices = np.searchsorted(zone_indices, np.arange(len(df)), side='right') - 1
             # Get the 'close' price of the last zone
-            df[f'dist_to_{zone_type}'] = (df['close'] - zones['close'].iloc[last_zone_indices].values).abs()
-            df[f'{zone_type}_width'] = (zones['high'].iloc[last_zone_indices].values - zones['low'].iloc[last_zone_indices].values)
+            last_zone_close = df['close'].values[zone_indices[last_zone_indices]]
+            df[f'dist_to_{zone_type}'] = np.abs(df['close'].values - last_zone_close)
+            df[f'{zone_type}_width'] = df['high'].values[zone_indices[last_zone_indices]] - df['low'].values[zone_indices[last_zone_indices]]
         else:
             df[f'dist_to_{zone_type}'] = 9999 # Use a large number to indicate no zone
             df[f'{zone_type}_width'] = 0
@@ -376,6 +403,9 @@ def create_features(df_main, df_higher_tf):
     df['day_of_week'] = df.index.dayofweek
 
     df.fillna(0, inplace=True) # Fill any other NaNs with 0
+    
+    # Multi-TF Context Ratios
+    df['htf_trend_slope'] = get_trend_slope(df['close_htf'])
 
     return df
 
@@ -387,7 +417,7 @@ def scale_features(df):
     # Select only numerical columns for scaling
     feature_cols = df.select_dtypes(include=np.number).columns.tolist()
     # Exclude target variables
-    targets = ['order_block', 'fair_value_gap', 'breaker_block', 'liquidity_run', 'mitigation_zone']
+    targets = ['order_block', 'fair_value_gap', 'breaker_block', 'liquidity_run']
     for target in targets:
         if target in feature_cols:
             feature_cols.remove(target)
@@ -415,12 +445,12 @@ def objective(trial, df, features):
     Objective function for Optuna hyperparameter tuning.
     """
     # Define hyperparameters to tune
-    solver = trial.suggest_categorical('solver', ['liblinear', 'saga'])
+    solver = trial.suggest_categorical('solver', ['lbfgs'])
     c = trial.suggest_float('C', 1e-4, 1e4, log=True)
 
-    params = {'solver': solver, 'C': c}
+    params = {'solver': solver, 'C': c, 'max_iter': 2000, 'class_weight': 'balanced'}
 
-    targets = ['order_block', 'fair_value_gap', 'breaker_block', 'liquidity_run', 'mitigation_zone']
+    targets = ['order_block', 'fair_value_gap', 'breaker_block', 'liquidity_run']
 
     X = df[features]
     y = df[targets]
@@ -456,6 +486,9 @@ def train_model(df, features, params=None):
     """
     if params is None:
         params = {}
+    params.setdefault('solver', 'lbfgs')
+    params.setdefault('max_iter', 2000)
+    params.setdefault('class_weight', 'balanced')
 
     targets = ['order_block', 'fair_value_gap', 'breaker_block', 'liquidity_run', 'mitigation_zone']
 
@@ -483,26 +516,28 @@ def train_model(df, features, params=None):
 
     return estimators, features
 
-def save_artifacts(models, scaler, model_path='smc_model.pkl', scaler_path='scaler.pkl'):
+def save_artifacts(models, scaler, features, model_path='smc_model.pkl', scaler_path='scaler.pkl', features_path='features.pkl'):
     """
-    Saves the trained models and scaler to files.
+    Saves the trained models, scaler and features to files.
     """
     joblib.dump(models, model_path)
     joblib.dump(scaler, scaler_path)
-    logger.info(f"Models saved to {model_path}, scaler saved to {scaler_path}")
+    joblib.dump(features, features_path)
+    logger.info(f"Models saved to {model_path}, scaler saved to {scaler_path}, features saved to {features_path}")
 
-def load_artifacts(model_path='smc_model.pkl', scaler_path='scaler.pkl'):
+def load_artifacts(model_path='smc_model.pkl', scaler_path='scaler.pkl', features_path='features.pkl'):
     """
-    Loads the models and scaler from files.
+    Loads the models, scaler and features from files.
     """
     try:
         models = joblib.load(model_path)
         scaler = joblib.load(scaler_path)
-        logger.info(f"Models and scaler loaded from {model_path} and {scaler_path}")
-        return models, scaler
+        features = joblib.load(features_path)
+        logger.info(f"Models, scaler and features loaded from {model_path}, {scaler_path} and {features_path}")
+        return models, scaler, features
     except FileNotFoundError:
-        logger.warning("Model or scaler artifacts not found. Need to train first.")
-        return None, None
+        logger.warning("Model, scaler or features artifacts not found. Need to train first.")
+        return None, None, None
 
 # --- Live Inference & Signal Construction ---
 
@@ -518,13 +553,12 @@ def get_signal(df_latest, models, scaler, features, symbol, df_higher_tf):
     htf_trend = df_higher_tf['htf_trend_slope'].iloc[-1]
     
     # Prepare features for the latest candle
-    latest_features_df = pd.DataFrame(df_latest[features])
-    latest_features_df = latest_features_df[features]  # Ensure column order
+    latest_features_df = df_latest[features]
     latest_features_df.fillna(0, inplace=True)
 
     latest_features_scaled = scaler.transform(latest_features_df)
 
-    patterns = ['order_block', 'fair_value_gap', 'breaker_block', 'liquidity_run', 'mitigation_zone']
+    patterns = ['order_block', 'fair_value_gap', 'breaker_block', 'liquidity_run']
     
     # --- Multi-Condition Logic ---
     met_conditions = []
@@ -712,10 +746,9 @@ async def main(application):
     if not authenticated_client:
         logger.warning("Could not create authenticated Binance client. Trading will be disabled.")
 
-    models, scaler = load_artifacts()
-    features = []
+    models, scaler, features = load_artifacts()
 
-    if models and scaler:
+    if models and scaler and features:
         user_input = input("Found existing models. Do you want to [r]etrain or [s]tart signal generation? ").lower()
         if user_input == 's':
             logger.info("Starting signal generation with the existing models.")
@@ -726,46 +759,63 @@ async def main(application):
             return
 
     if not models or not scaler:
-        logger.info("Performing initial data load and model training for all symbols...")
-        
-        last_symbol = None
-        if os.path.exists("last_symbol.txt"):
-            with open("last_symbol.txt", "r") as f:
-                last_symbol = f.read().strip()
-        
-        start_index = 0
-        if last_symbol in TRADING_SYMBOLS:
-            start_index = TRADING_SYMBOLS.index(last_symbol) + 1
-            
-        with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-            results = list(tqdm(executor.map(process_symbol, TRADING_SYMBOLS[start_index:]), total=len(TRADING_SYMBOLS[start_index:]), desc="Processing Symbols"))
+        train_mode = input("Do you want to perform a [f]ull train or a [q]uick train? ").lower()
+        if train_mode == 'q':
+            logger.info("Performing quick model training...")
+            symbols_to_process = TRADING_SYMBOLS[:1]
+            days_to_fetch = 30
+        elif train_mode == 'f':
+            logger.info("Performing full model training...")
+            symbols_to_process = TRADING_SYMBOLS
+            days_to_fetch = None # Fetch all data
+        else:
+            logger.error("Invalid training mode selected. Exiting.")
+            return
 
-        all_dfs_5m = [result[0] for result in results if result is not None]
-        all_dfs_1h = [result[1] for result in results if result is not None]
+        all_dfs_5m = []
+        all_dfs_1h = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            results = list(get_progress_bar(executor.map(process_symbol, symbols_to_process), total=len(symbols_to_process), desc="Processing Symbols"))
+
+        for result in results:
+            if result is not None:
+                df_5m, df_1h = result
+                if days_to_fetch:
+                    df_5m = df_5m.last(f'{days_to_fetch}D')
+                    df_1h = df_1h.last(f'{days_to_fetch}D')
+                all_dfs_5m.append(df_5m)
+                all_dfs_1h.append(df_1h)
 
         if not all_dfs_5m:
             logger.error("No data fetched for any symbol. Exiting.")
             return
-
+            
         # Combine data from all symbols
         combined_df_5m = pd.concat(all_dfs_5m)
         combined_df_1h = pd.concat(all_dfs_1h)
         
-        logger.info("Creating features for combined data...")
-        features_df = create_features(combined_df_5m, combined_df_1h)
+        features_cache_path = 'features_df.pkl'
+        if os.path.exists(features_cache_path):
+            logger.info("Loading cached features...")
+            features_df = pd.read_pickle(features_cache_path)
+        else:
+            logger.info("Creating features for combined data...")
+            features_df = create_features(combined_df_5m, combined_df_1h)
+            features_df.to_pickle(features_cache_path)
 
         scaled_df, scaler, features = scale_features(features_df)
 
         logger.info("Running Optuna hyperparameter tuning...")
         study = optuna.create_study(direction='maximize')
-        study.optimize(lambda trial: objective(trial, scaled_df, features), n_trials=args.optuna_trials)
+        study.optimize(lambda trial: objective(trial, scaled_df, features), n_trials=args.optuna_trials, n_jobs=-1, timeout=600)
         best_params = study.best_params
         logger.info(f"Best Optuna params: {best_params}")
 
-        models, _ = train_model(scaled_df, features, best_params)
+        models, features = train_model(scaled_df, features, best_params)
 
-        if models and scaler:
-            save_artifacts(models, scaler)
+        if models and scaler and features:
+            save_artifacts(models, scaler, features)
         else:
             logger.error("Model training failed. Exiting.")
             return
@@ -773,6 +823,8 @@ async def main(application):
     # --- Live Trading Loop ---
     logger.info("Starting live trading loop...")
     open_orders = []
+    total_symbols_processed = 0
+    errors_encountered = 0
     while True:
         try:
             if application.bot_data.get('paused', False):
@@ -782,21 +834,21 @@ async def main(application):
             # Trail stop losses for open orders
             if authenticated_client:
                 for order in open_orders:
-                    atr = fetch_ohlcv(unauthenticated_client, order['symbol'], '5m', limit=20)['close'].std() # Simplified ATR
+                    atr = fetch_ohlcv(unauthenticated_client, order['symbol'], '5m')['close'].std() # Simplified ATR
                     trail_stop_loss(authenticated_client, order, atr)
 
             for symbol in TRADING_SYMBOLS:
                 # Fetch latest data
-                latest_df_5m = fetch_ohlcv(unauthenticated_client, symbol, '5m', limit=100)
-                latest_df_1h = fetch_ohlcv(unauthenticated_client, symbol, '1h', limit=100)
+                latest_df_5m = fetch_ohlcv(unauthenticated_client, symbol, '5m', limit=1000)
+                latest_df_1h = fetch_ohlcv(unauthenticated_client, symbol, '1h', limit=300)
 
                 if latest_df_5m.empty or latest_df_1h.empty:
                     logger.warning(f"Could not fetch latest data for {symbol}. Skipping...")
                     continue
 
                 # Label and feature engineer the latest data
-                latest_df_5m = label_smc_patterns(latest_df_5m)
-                latest_df_1h = label_smc_patterns(latest_df_1h)
+                latest_df_5m = label_smc_patterns(latest_df_5m, args.debug)
+                latest_df_1h = label_smc_patterns(latest_df_1h, args.debug)
                 latest_features_df = create_features(latest_df_5m, latest_df_1h)
 
                 if features: # Ensure features are defined
@@ -804,7 +856,7 @@ async def main(application):
                     last_candle_features = latest_features_df.iloc[[-1]]
 
                     # Get signal
-                    signal = get_signal(last_candle_features, models, scaler, features, symbol, latest_df_1h)
+                    signal = get_signal(last_candle_features, models, scaler, features, symbol, latest_features_df)
 
                     if signal:
                         await send_telegram_alert(signal)
@@ -814,16 +866,26 @@ async def main(application):
                             if order:
                                 open_orders.append(order)
 
+            total_symbols_processed += len(TRADING_SYMBOLS)
+            logger.info("--- Progress Summary ---")
+            logger.info(f"Total symbols processed in this cycle: {len(TRADING_SYMBOLS)}")
+            logger.info(f"Total symbols processed overall: {total_symbols_processed}")
+            logger.info(f"Errors encountered in this cycle: {errors_encountered}")
+            logger.info("--------------------------")
+            errors_encountered = 0  # Reset for the next cycle
+
             # Wait for a shorter interval for higher frequency
             logger.info("Completed a cycle through all symbols. Waiting for 1 minute...")
             await asyncio.sleep(60) # 1 minute
 
         except ccxt.NetworkError as e:
             logger.error(f"Network error: {e}. Reconnecting...")
+            errors_encountered += 1
             await asyncio.sleep(60)
             binance_client = get_binance_client()
         except Exception as e:
             logger.error(f"An unexpected error occurred in the main loop: {e}")
+            errors_encountered += 1
             await asyncio.sleep(60)
 
 def start(update, context):
@@ -862,8 +924,8 @@ def run_backtest(symbol, days=30):
         return
 
     # Prepare data and model
-    df_5m = label_smc_patterns(df_5m)
-    df_1h = label_smc_patterns(df_1h)
+    df_5m = label_smc_patterns(df_5m, args.debug)
+    df_1h = label_smc_patterns(df_1h, args.debug)
     features_df = create_features(df_5m, df_1h)
     scaled_df, scaler = scale_features(features_df)
     model, features = train_model(scaled_df)
@@ -932,6 +994,7 @@ if __name__ == "__main__":
     parser.add_argument('--backtest', type=str, help='Run a backtest for the specified symbol (e.g., BTC/USDT)')
     parser.add_argument('--days', type=int, default=30, help='Number of days to backtest')
     parser.add_argument('--optuna-trials', type=int, default=10, help='Number of Optuna trials to run')
+    parser.add_argument('--debug', action='store_true', help='Run in sequential mode for debugging')
     args = parser.parse_args()
 
     if args.backtest:
